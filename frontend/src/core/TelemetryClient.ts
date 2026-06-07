@@ -7,7 +7,10 @@ export interface TelemetryClientOptions {
   url: string
   onFrame: (frame: MptFrame) => void
   onStatusChange: (status: ConnectionStatus) => void
-  reconnectInterval?: number
+  baseInterval?: number
+  maxInterval?: number
+  maxRetries?: number
+  jitterFactor?: number
 }
 
 export class TelemetryClient {
@@ -15,16 +18,27 @@ export class TelemetryClient {
   private url: string
   private onFrame: (frame: MptFrame) => void
   private onStatusChange: (status: ConnectionStatus) => void
-  private reconnectInterval: number
+
+  private baseInterval: number
+  private maxInterval: number
+  private maxRetries: number
+  private jitterFactor: number
+
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private intentionallyClosed = false
   private status: ConnectionStatus = 'disconnected'
+
+  private retryCount = 0
+  private currentBackoff = 0
 
   constructor(options: TelemetryClientOptions) {
     this.url = options.url
     this.onFrame = options.onFrame
     this.onStatusChange = options.onStatusChange
-    this.reconnectInterval = options.reconnectInterval ?? 3000
+    this.baseInterval = options.baseInterval ?? 1000
+    this.maxInterval = options.maxInterval ?? 30000
+    this.maxRetries = options.maxRetries ?? Infinity
+    this.jitterFactor = options.jitterFactor ?? 0.3
   }
 
   connect() {
@@ -36,6 +50,8 @@ export class TelemetryClient {
       this.ws.binaryType = 'arraybuffer'
 
       this.ws.onopen = () => {
+        this.retryCount = 0
+        this.currentBackoff = 0
         this.setStatus('connected')
       }
 
@@ -66,19 +82,26 @@ export class TelemetryClient {
 
   disconnect() {
     this.intentionallyClosed = true
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
-      this.reconnectTimer = null
-    }
+    this.clearReconnectTimer()
     if (this.ws) {
+      this.ws.onclose = null
+      this.ws.onerror = null
+      this.ws.onopen = null
+      this.ws.onmessage = null
       this.ws.close()
       this.ws = null
     }
+    this.retryCount = 0
+    this.currentBackoff = 0
     this.setStatus('disconnected')
   }
 
   getStatus(): ConnectionStatus {
     return this.status
+  }
+
+  getRetryCount(): number {
+    return this.retryCount
   }
 
   private setStatus(status: ConnectionStatus) {
@@ -90,9 +113,33 @@ export class TelemetryClient {
 
   private scheduleReconnect() {
     if (this.reconnectTimer) return
+
+    if (this.retryCount >= this.maxRetries) {
+      return
+    }
+
+    const backoff = this.calculateBackoff()
+    this.currentBackoff = backoff
+
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
+      this.retryCount++
       this.connect()
-    }, this.reconnectInterval)
+    }, backoff)
+  }
+
+  private calculateBackoff(): number {
+    const exponentialDelay = this.baseInterval * Math.pow(2, this.retryCount)
+    const clampedDelay = Math.min(exponentialDelay, this.maxInterval)
+    const jitter = clampedDelay * this.jitterFactor * Math.random()
+    const delay = clampedDelay + jitter - (clampedDelay * this.jitterFactor / 2)
+    return Math.max(this.baseInterval, Math.round(delay))
+  }
+
+  private clearReconnectTimer() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
   }
 }

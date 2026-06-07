@@ -3,9 +3,9 @@ package com.lwd.telemetry.mpt;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.util.ReferenceCountUtil;
 import lombok.extern.slf4j.Slf4j;
 
-import java.nio.ByteOrder;
 import java.util.List;
 import java.util.zip.CRC32;
 
@@ -36,6 +36,16 @@ public class MptFrameDecoder extends ByteToMessageDecoder {
     private final CRC32 crc32 = new CRC32();
     private long computedCrc;
 
+    private ChannelHandlerContext storedCtx;
+
+    private static final int HEADER_REMAINING = MptConstants.FRAME_HEADER_SIZE - 4;
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+        this.storedCtx = ctx;
+        super.handlerAdded(ctx);
+    }
+
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
         loop:
@@ -50,11 +60,15 @@ public class MptFrameDecoder extends ByteToMessageDecoder {
                     break;
                 }
                 case READING_HEADER: {
-                    if (in.readableBytes() < MptConstants.FRAME_HEADER_SIZE - 4) {
+                    if (in.readableBytes() < HEADER_REMAINING) {
                         break loop;
                     }
+                    in.markReaderIndex();
                     if (!readHeader(in)) {
+                        in.resetReaderIndex();
                         state = DecodeState.SEEKING_SYNC;
+                        syncBytesMatched = 0;
+                        syncAccumulator = 0;
                         notifySyncLost(ctx);
                         break;
                     }
@@ -138,29 +152,27 @@ public class MptFrameDecoder extends ByteToMessageDecoder {
     }
 
     private boolean readHeader(ByteBuf in) {
-        ByteBuf le = in.order(ByteOrder.LITTLE_ENDIAN);
+        frameLength = in.readIntLE();
+        updateCrcFromInt(frameLength);
 
-        frameLength = le.readInt();
-        crc32.update(le.array()[le.readerIndex() - 4], 0, 4);
-
-        frameSequence = le.readInt();
+        frameSequence = in.readIntLE();
         updateCrcFromInt(frameSequence);
 
-        int typeStatus = le.readUnsignedShort();
+        int typeStatus = in.readUnsignedShortLE();
         frameType = (short) ((typeStatus >> 8) & 0xFF);
         statusCode = (short) (typeStatus & 0xFF);
         updateCrcFromShort(typeStatus);
 
-        bitDepth = Float.intBitsToFloat(le.readInt());
+        bitDepth = Float.intBitsToFloat(in.readIntLE());
         updateCrcFromInt(Float.floatToRawIntBits(bitDepth));
 
-        temperature = Float.intBitsToFloat(le.readInt());
+        temperature = Float.intBitsToFloat(in.readIntLE());
         updateCrcFromInt(Float.floatToRawIntBits(temperature));
 
-        mudPressure = Float.intBitsToFloat(le.readInt());
+        mudPressure = Float.intBitsToFloat(in.readIntLE());
         updateCrcFromInt(Float.floatToRawIntBits(mudPressure));
 
-        int maskSample = le.readUnsignedShort();
+        int maskSample = in.readUnsignedShortLE();
         channelMask = (short) ((maskSample >> 12) & 0x0F);
         sampleCount = maskSample & 0x0FFF;
         updateCrcFromShort(maskSample);
@@ -182,20 +194,21 @@ public class MptFrameDecoder extends ByteToMessageDecoder {
 
     private float[][] readWaveformData(ByteBuf in, int totalBytes) {
         float[][] data = new float[MptConstants.WAVEFORM_CHANNELS][sampleCount];
-        ByteBuf le = in.order(ByteOrder.LITTLE_ENDIAN);
+
+        int startReaderIndex = in.readerIndex();
 
         for (int ch = 0; ch < MptConstants.WAVEFORM_CHANNELS; ch++) {
             if ((channelMask & (1 << ch)) == 0) {
                 continue;
             }
             for (int s = 0; s < sampleCount; s++) {
-                short raw = le.readShort();
+                short raw = in.readShortLE();
                 data[ch][s] = raw / 32768.0f;
             }
         }
 
         byte[] waveformBytes = new byte[totalBytes];
-        in.getBytes(in.readerIndex() - totalBytes, waveformBytes, 0, totalBytes);
+        in.getBytes(startReaderIndex, waveformBytes, 0, totalBytes);
         crc32.update(waveformBytes, 0, totalBytes);
 
         return data;
@@ -222,11 +235,45 @@ public class MptFrameDecoder extends ByteToMessageDecoder {
     }
 
     @Override
-    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.error("MPT decoder error", cause);
+    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+        releaseStalePartialFrame(ctx);
+        resetState();
+        super.handlerRemoved(ctx);
+    }
+
+    @Override
+    protected void decodeLast(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
+        if (in.isReadable()) {
+            decode(ctx, in, out);
+        }
+        releaseStalePartialFrame(ctx);
+        resetState();
+    }
+
+    private void releaseStalePartialFrame(ChannelHandlerContext ctx) {
+        if (ctx != null && ctx.channel().hasAttr(MptAttrKeys.PARTIAL_FRAME)) {
+            MptFrame stale = ctx.channel().attr(MptAttrKeys.PARTIAL_FRAME).getAndSet(null);
+            if (stale != null) {
+                log.warn("Releasing stale partial frame during cleanup, seq={}", stale.getFrameSequence());
+            }
+        }
+    }
+
+    private void resetState() {
         state = DecodeState.SEEKING_SYNC;
         syncBytesMatched = 0;
         syncAccumulator = 0;
+        crc32.reset();
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        log.error("MPT decoder error", cause);
+
+        Object stale = ctx.channel().attr(MptAttrKeys.PARTIAL_FRAME).getAndSet(null);
+        ReferenceCountUtil.safeRelease(stale);
+
+        resetState();
         ctx.close();
     }
 }
