@@ -11,8 +11,20 @@
         <span class="stat">深度: {{ currentDepth.toFixed(1) }}m</span>
         <span class="stat">温度: {{ currentTemp.toFixed(1) }}&#8451;</span>
         <span class="stat">压力: {{ currentPressure.toFixed(0) }}psi</span>
+        <span class="stat">GR: {{ currentGammaRay.toFixed(1) }}API</span>
       </div>
     </header>
+
+    <div v-if="lithologyAlert.alertLevel !== 'NORMAL'" class="alert-banner" :class="'alert-' + lithologyAlert.alertLevel.toLowerCase()">
+      <span class="alert-icon">{{ lithologyAlert.alertLevel === 'CRITICAL' ? '🔴' : '🟡' }}</span>
+      <span class="alert-msg">{{ lithologyAlert.alertMessage }}</span>
+      <span class="alert-detail">
+        孔隙度={{ (lithologyAlert.porosity * 100).toFixed(1) }}%
+        | Δt={{ lithologyAlert.transitTimeFiltered.toFixed(1) }}μs/ft
+        | GR={{ lithologyAlert.gammaRayFiltered.toFixed(1) }}API
+        | 岩性={{ lithologyAlert.lithologyType }}
+      </span>
+    </div>
 
     <main class="main-area">
       <aside class="depth-ruler">
@@ -40,6 +52,49 @@
           <canvas :ref="(el) => setWfCanvas(el, idx)" class="wf-canvas"></canvas>
         </div>
       </section>
+
+      <aside class="lithology-panel">
+        <div class="litho-title">岩性诊断</div>
+        <div class="litho-item">
+          <span class="litho-label">孔隙度</span>
+          <span class="litho-val" :class="{ 'val-warn': lithologyAlert.porosity > 0.15 }">
+            {{ (lithologyAlert.porosity * 100).toFixed(1) }}%
+          </span>
+        </div>
+        <div class="litho-item">
+          <span class="litho-label">首波Δt</span>
+          <span class="litho-val">{{ lithologyAlert.transitTimeFiltered.toFixed(1) }}μs/ft</span>
+        </div>
+        <div class="litho-item">
+          <span class="litho-label">衰减</span>
+          <span class="litho-val">{{ lithologyAlert.attenuationFiltered.toFixed(3) }}</span>
+        </div>
+        <div class="litho-item">
+          <span class="litho-label">GR</span>
+          <span class="litho-val" :class="{ 'val-warn': lithologyAlert.gammaRayFiltered < 30 }">
+            {{ lithologyAlert.gammaRayFiltered.toFixed(1) }}API
+          </span>
+        </div>
+        <div class="litho-item">
+          <span class="litho-label">Δφ</span>
+          <span class="litho-val" :class="{ 'val-warn': lithologyAlert.porosityDelta > 0.08 }">
+            {{ (lithologyAlert.porosityDelta * 100).toFixed(2) }}%
+          </span>
+        </div>
+        <div class="litho-divider"></div>
+        <div class="litho-item">
+          <span class="litho-label">岩性</span>
+          <span class="litho-val litho-type" :class="'type-' + lithologyAlert.lithologyType.toLowerCase()">
+            {{ lithologyTypeName }}
+          </span>
+        </div>
+        <div class="litho-item">
+          <span class="litho-label">预警</span>
+          <span class="litho-val" :class="'alert-level-' + lithologyAlert.alertLevel.toLowerCase()">
+            {{ lithologyAlert.alertLevel }}
+          </span>
+        </div>
+      </aside>
     </main>
 
     <footer class="control-bar">
@@ -66,6 +121,10 @@
         </select>
       </div>
       <div class="ctrl-group">
+        <label>蜂鸣</label>
+        <input type="checkbox" v-model="audioEnabled" />
+      </div>
+      <div class="ctrl-group">
         <button class="btn" @click="toggleConnection">{{ connectBtnText }}</button>
       </div>
     </footer>
@@ -75,10 +134,13 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onBeforeUnmount, computed, nextTick } from 'vue'
 import type { MptFrame } from './types/MptFrame'
-import { VDLRenderer, type VDLRenderConfig } from './core/VDLRenderer'
+import type { LithologyAlert } from './types/LithologyAlert'
+import { VDLRenderer, type VDLRenderConfig, type AlertBand } from './core/VDLRenderer'
 import { WaveformRenderer } from './core/WaveformRenderer'
 import { WaveformBuffer } from './core/WaveformBuffer'
 import { TelemetryClient, type ConnectionStatus } from './core/TelemetryClient'
+import { LithologyEngine, type LithologyState } from './core/LithologyEngine'
+import { AlertAudio } from './core/AlertAudio'
 
 const channels = [
   { key: 'pwave', label: '纵波 P-Wave' },
@@ -94,10 +156,23 @@ const frameCount = ref(0)
 const currentDepth = ref(2500)
 const currentTemp = ref(150)
 const currentPressure = ref(5000)
+const currentGammaRay = ref(45)
 const colormapName = ref('jet')
 const gain = ref(1.0)
 const activeChannel = ref(0)
 const connectionStatus = ref<ConnectionStatus>('disconnected')
+const audioEnabled = ref(true)
+
+const lithologyAlert = reactive<LithologyState>({
+  transitTimeFiltered: 0,
+  attenuationFiltered: 0,
+  gammaRayFiltered: 0,
+  porosity: 0,
+  porosityDelta: 0,
+  lithologyType: 'UNKNOWN',
+  alertLevel: 'NORMAL',
+  alertMessage: '',
+})
 
 const isPanning = ref(false)
 const panStartX = ref(0)
@@ -107,9 +182,13 @@ const panVdlIdx = ref(0)
 let vdlRenderers: (VDLRenderer | null)[] = [null, null, null]
 let wfRenderers: (WaveformRenderer | null)[] = [null, null, null]
 let waveBuffer: WaveformBuffer | null = null
+let lithologyEngine: LithologyEngine | null = null
+let alertAudio: AlertAudio | null = null
 let telemetryClient: TelemetryClient | null = null
 let depthCtx: CanvasRenderingContext2D | null = null
-let animId = 0
+
+let alertBandRowStart = -1
+let alertBandRowEnd = -1
 
 const statusClass = computed(() => {
   const map: Record<ConnectionStatus, string> = {
@@ -134,6 +213,17 @@ const statusText = computed(() => {
 const connectBtnText = computed(() =>
   connectionStatus.value === 'connected' ? '断开' : '连接'
 )
+
+const lithologyTypeName = computed(() => {
+  const map: Record<string, string> = {
+    SANDSTONE: '砂岩',
+    SHALE: '泥岩',
+    GAS_ZONE: '气层',
+    WATER_ZONE: '水层',
+    UNKNOWN: '未知',
+  }
+  return map[lithologyAlert.lithologyType] || lithologyAlert.lithologyType
+})
 
 function setVdlCanvas(el: any, idx: number) {
   vdlCanvases.value[idx] = el as HTMLCanvasElement | null
@@ -181,6 +271,7 @@ function onFrame(frame: MptFrame) {
   currentDepth.value = frame.bitDepth
   currentTemp.value = frame.temperature
   currentPressure.value = frame.mudPressure
+  currentGammaRay.value = frame.gammaRay
 
   if (waveBuffer) {
     waveBuffer.push(frame)
@@ -198,7 +289,57 @@ function onFrame(frame: MptFrame) {
     }
   }
 
+  if (lithologyEngine && frame.waveformData.length > 0) {
+    const state = lithologyEngine.evaluateLocal(
+      frame.waveformData[0],
+      frame.gammaRay,
+      frame.bitDepth
+    )
+    Object.assign(lithologyAlert, state)
+
+    updateAlertBands(state)
+  }
+
   renderDepthRuler()
+}
+
+function onAlert(alert: LithologyAlert) {
+  if (lithologyEngine) {
+    lithologyEngine.pushServerAlert(alert)
+    Object.assign(lithologyAlert, lithologyEngine.currentState)
+  }
+
+  updateAlertBands(lithologyAlert)
+
+  if (audioEnabled.value && alert.alertLevel !== 'NORMAL' && alertAudio) {
+    alertAudio.play()
+  }
+}
+
+function updateAlertBands(state: LithologyState) {
+  if (state.alertLevel !== 'NORMAL') {
+    const currentRow = vdlRenderers[0]?.getCurrentRow() ?? 0
+    alertBandRowStart = Math.max(0, currentRow - 3)
+    alertBandRowEnd = currentRow + 1
+  } else {
+    alertBandRowStart = -1
+    alertBandRowEnd = -1
+  }
+
+  for (let i = 0; i < 3; i++) {
+    const vdl = vdlRenderers[i]
+    if (vdl) {
+      if (alertBandRowStart >= 0 && alertBandRowEnd >= 0) {
+        vdl.setAlertBands([{
+          rowStart: alertBandRowStart,
+          rowEnd: alertBandRowEnd,
+          level: state.alertLevel as 'WARNING' | 'CRITICAL',
+        }])
+      } else {
+        vdl.setAlertBands([])
+      }
+    }
+  }
 }
 
 function renderDepthRuler() {
@@ -280,6 +421,9 @@ onMounted(async () => {
     channels: 3,
   })
 
+  lithologyEngine = new LithologyEngine()
+  alertAudio = new AlertAudio()
+
   initRenderers()
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -288,6 +432,7 @@ onMounted(async () => {
   telemetryClient = new TelemetryClient({
     url: wsUrl,
     onFrame,
+    onAlert,
     onStatusChange,
   })
 
@@ -295,9 +440,9 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
-  if (animId) cancelAnimationFrame(animId)
   vdlRenderers.forEach(r => r?.destroy())
   wfRenderers.forEach(r => r?.destroy())
+  alertAudio?.destroy()
   telemetryClient?.disconnect()
 })
 </script>
@@ -364,6 +509,38 @@ onBeforeUnmount(() => {
 .status-err { background: rgba(255, 60, 60, 0.2); color: #ff3c3c; }
 
 .stat { color: #8b949e; }
+
+.alert-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 20px;
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+  animation: alertPulse 1.5s ease-in-out infinite;
+}
+
+.alert-banner.alert-warning {
+  background: linear-gradient(90deg, rgba(255, 200, 0, 0.15), rgba(255, 200, 0, 0.05));
+  border-bottom: 1px solid rgba(255, 200, 0, 0.3);
+  color: #ffc800;
+}
+
+.alert-banner.alert-critical {
+  background: linear-gradient(90deg, rgba(255, 40, 40, 0.2), rgba(255, 40, 40, 0.05));
+  border-bottom: 1px solid rgba(255, 40, 40, 0.4);
+  color: #ff4444;
+}
+
+.alert-icon { font-size: 14px; }
+.alert-msg { font-size: 13px; }
+.alert-detail { color: #8b949e; font-weight: 400; font-size: 11px; }
+
+@keyframes alertPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
 
 .main-area {
   flex: 1;
@@ -444,6 +621,68 @@ onBeforeUnmount(() => {
   height: 100%;
 }
 
+.lithology-panel {
+  width: 140px;
+  flex-shrink: 0;
+  background: #0d1117;
+  border-left: 1px solid #1e293b;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.litho-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: #00ccff;
+  text-align: center;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #1e293b;
+}
+
+.litho-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+}
+
+.litho-label {
+  color: #8b949e;
+}
+
+.litho-val {
+  color: #e0e6f0;
+  font-weight: 600;
+}
+
+.val-warn {
+  color: #ff6644;
+}
+
+.litho-divider {
+  height: 1px;
+  background: #1e293b;
+  margin: 4px 0;
+}
+
+.litho-type {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.type-sandstone { background: rgba(210, 180, 100, 0.2); color: #d2b464; }
+.type-shale { background: rgba(128, 128, 128, 0.2); color: #999; }
+.type-gas_zone { background: rgba(255, 60, 60, 0.2); color: #ff4444; }
+.type-water_zone { background: rgba(60, 140, 255, 0.2); color: #4488ff; }
+.type-unknown { background: rgba(128, 128, 128, 0.1); color: #666; }
+
+.alert-level-normal { color: #00ff88; }
+.alert-level-warning { color: #ffc800; }
+.alert-level-critical { color: #ff4444; animation: alertPulse 1s infinite; }
+
 .control-bar {
   display: flex;
   align-items: center;
@@ -479,6 +718,10 @@ onBeforeUnmount(() => {
 
 .ctrl-group input[type="range"] {
   width: 80px;
+  accent-color: #00ff88;
+}
+
+.ctrl-group input[type="checkbox"] {
   accent-color: #00ff88;
 }
 

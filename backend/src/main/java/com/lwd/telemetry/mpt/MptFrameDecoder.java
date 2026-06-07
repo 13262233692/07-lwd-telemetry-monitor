@@ -30,6 +30,7 @@ public class MptFrameDecoder extends ByteToMessageDecoder {
     private float bitDepth;
     private float temperature;
     private float mudPressure;
+    private float gammaRay;
     private short channelMask;
     private int sampleCount;
 
@@ -92,6 +93,7 @@ public class MptFrameDecoder extends ByteToMessageDecoder {
                             .bitDepth(bitDepth)
                             .temperature(temperature)
                             .mudPressure(mudPressure)
+                            .gammaRay(gammaRay)
                             .channelMask(channelMask)
                             .sampleCount(sampleCount)
                             .waveformData(waveformData)
@@ -171,6 +173,9 @@ public class MptFrameDecoder extends ByteToMessageDecoder {
 
         mudPressure = Float.intBitsToFloat(in.readIntLE());
         updateCrcFromInt(Float.floatToRawIntBits(mudPressure));
+
+        gammaRay = Float.intBitsToFloat(in.readIntLE());
+        updateCrcFromInt(Float.floatToRawIntBits(gammaRay));
 
         int maskSample = in.readUnsignedShortLE();
         channelMask = (short) ((maskSample >> 12) & 0x0F);

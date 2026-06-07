@@ -13,31 +13,40 @@ varying vec2 v_texCoord;
 uniform sampler2D u_vdlTexture;
 uniform sampler2D u_colormap;
 uniform float u_opacity;
+uniform float u_alertActive;
+uniform float u_alertRowStart;
+uniform float u_alertRowEnd;
+uniform vec3 u_alertColor;
 void main() {
     float intensity = texture2D(u_vdlTexture, v_texCoord).r;
     vec4 color = texture2D(u_colormap, vec2(intensity, 0.5));
     color.a *= u_opacity;
+
+    if (u_alertActive > 0.5) {
+        float rowCoord = v_texCoord.y;
+        if (rowCoord >= u_alertRowStart && rowCoord <= u_alertRowEnd) {
+            float edgeFade = 1.0;
+            float edgeWidth = 0.008;
+            if (rowCoord < u_alertRowStart + edgeWidth) {
+                edgeFade = (rowCoord - u_alertRowStart) / edgeWidth;
+            } else if (rowCoord > u_alertRowEnd - edgeWidth) {
+                edgeFade = (u_alertRowEnd - rowCoord) / edgeWidth;
+            }
+            float pulse = 0.6 + 0.4 * sin(u_alertActive * 3.14159 * 2.0);
+            vec4 alertColor = vec4(u_alertColor * pulse, edgeFade * 0.45);
+            color = mix(color, alertColor, alertColor.a);
+        }
+    }
+
     gl_FragColor = color;
 }
 `
 
-const COLORMAP_FRAG = `
-precision mediump float;
-varying vec2 v_texCoord;
-uniform sampler2D u_vdlTexture;
-uniform vec2 u_viewOffset;
-uniform vec2 u_viewScale;
-uniform float u_gain;
-uniform float u_rangeMin;
-uniform float u_rangeMax;
-void main() {
-    vec2 sampleCoord = v_texCoord * u_viewScale + u_viewOffset;
-    float intensity = texture2D(u_vdlTexture, sampleCoord).r;
-    intensity = clamp((intensity - u_rangeMin) / (u_rangeMax - u_rangeMin + 0.0001), 0.0, 1.0);
-    intensity = pow(intensity, 1.0 / (u_gain + 0.01));
-    gl_FragColor = vec4(intensity, intensity, intensity, 1.0);
+export interface AlertBand {
+  rowStart: number
+  rowEnd: number
+  level: 'WARNING' | 'CRITICAL'
 }
-`
 
 export interface VDLRenderConfig {
   width: number
@@ -78,6 +87,9 @@ export class VDLRenderer {
   private animFrameId = 0
   private rendering = false
 
+  private alertBands: AlertBand[] = []
+  private alertAnimPhase = 0
+
   constructor(canvas: HTMLCanvasElement, config: VDLRenderConfig) {
     const gl = canvas.getContext('webgl', {
       alpha: false,
@@ -98,7 +110,7 @@ export class VDLRenderer {
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 
     this.program = this.createProgram(VERT_SRC, FRAG_SRC)
-    this.colormapProgram = this.createProgram(VERT_SRC, COLORMAP_FRAG)
+    this.colormapProgram = this.createProgram(VERT_SRC, '')
 
     this.quadBuffer = gl.createBuffer()!
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer)
@@ -114,7 +126,7 @@ export class VDLRenderer {
   private createProgram(vertSrc: string, fragSrc: string): WebGLProgram {
     const gl = this.gl
     const vs = this.compileShader(gl.VERTEX_SHADER, vertSrc)
-    const fs = this.compileShader(gl.FRAGMENT_SHADER, fragSrc)
+    const fs = this.compileShader(gl.FRAGMENT_SHADER, fragSrc || 'precision mediump float; void main() { gl_FragColor = vec4(1.0); }')
     const prog = gl.createProgram()!
     gl.attachShader(prog, vs)
     gl.attachShader(prog, fs)
@@ -248,6 +260,10 @@ export class VDLRenderer {
     this.currentRow++
   }
 
+  setAlertBands(bands: AlertBand[]) {
+    this.alertBands = bands
+  }
+
   swapBuffers() {
     const temp = this.frontTexture
     this.frontTexture = this.backTexture
@@ -282,6 +298,29 @@ export class VDLRenderer {
 
     const opacityLoc = gl.getUniformLocation(this.program, 'u_opacity')
     gl.uniform1f(opacityLoc, 1.0)
+
+    const hasAlert = this.alertBands.length > 0
+    const alertActiveLoc = gl.getUniformLocation(this.program, 'u_alertActive')
+    gl.uniform1f(alertActiveLoc, hasAlert ? 1.0 : 0.0)
+
+    if (hasAlert) {
+      this.alertAnimPhase += 0.05
+      const alertAnimLoc = gl.getUniformLocation(this.program, 'u_alertActive')
+      gl.uniform1f(alertAnimLoc, 0.5 + 0.5 * Math.sin(this.alertAnimPhase))
+
+      const band = this.alertBands[this.alertBands.length - 1]
+      const rowStart = 1.0 - (band.rowEnd / this.totalRows)
+      const rowEnd = 1.0 - (band.rowStart / this.totalRows)
+
+      const alertRowStartLoc = gl.getUniformLocation(this.program, 'u_alertRowStart')
+      gl.uniform1f(alertRowStartLoc, rowStart)
+      const alertRowEndLoc = gl.getUniformLocation(this.program, 'u_alertRowEnd')
+      gl.uniform1f(alertRowEndLoc, rowEnd)
+
+      const isCritical = band.level === 'CRITICAL'
+      const alertColorLoc = gl.getUniformLocation(this.program, 'u_alertColor')
+      gl.uniform3f(alertColorLoc, isCritical ? 1.0 : 1.0, isCritical ? 0.1 : 0.5, 0.1)
+    }
 
     gl.drawArrays(gl.TRIANGLES, 0, 6)
   }

@@ -15,6 +15,7 @@ public class MptFrame {
     private float bitDepth;
     private float temperature;
     private float mudPressure;
+    private float gammaRay;
     private short channelMask;
     private int sampleCount;
     private float[][] waveformData;

@@ -7,6 +7,7 @@ export interface MptFrame {
   bitDepth: number
   temperature: number
   mudPressure: number
+  gammaRay: number
   channelMask: number
   sampleCount: number
   waveformData: Float32Array[]

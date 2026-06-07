@@ -4,7 +4,7 @@ public final class MptConstants {
 
     public static final int FRAME_SYNC_WORD = 0xABCD1234;
 
-    public static final int FRAME_HEADER_SIZE = 16;
+    public static final int FRAME_HEADER_SIZE = 20;
 
     public static final int WAVEFORM_P_WAVE = 0;
     public static final int WAVEFORM_S_WAVE = 1;

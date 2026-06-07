@@ -1,4 +1,5 @@
 import type { MptFrame } from '../types/MptFrame'
+import type { LithologyAlert } from '../types/LithologyAlert'
 import { MptFrameParser } from './MptFrameParser'
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error'
@@ -6,6 +7,7 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'er
 export interface TelemetryClientOptions {
   url: string
   onFrame: (frame: MptFrame) => void
+  onAlert: (alert: LithologyAlert) => void
   onStatusChange: (status: ConnectionStatus) => void
   baseInterval?: number
   maxInterval?: number
@@ -17,6 +19,7 @@ export class TelemetryClient {
   private ws: WebSocket | null = null
   private url: string
   private onFrame: (frame: MptFrame) => void
+  private onAlert: (alert: LithologyAlert) => void
   private onStatusChange: (status: ConnectionStatus) => void
 
   private baseInterval: number
@@ -34,6 +37,7 @@ export class TelemetryClient {
   constructor(options: TelemetryClientOptions) {
     this.url = options.url
     this.onFrame = options.onFrame
+    this.onAlert = options.onAlert
     this.onStatusChange = options.onStatusChange
     this.baseInterval = options.baseInterval ?? 1000
     this.maxInterval = options.maxInterval ?? 30000
@@ -57,9 +61,13 @@ export class TelemetryClient {
 
       this.ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
-          const frame = MptFrameParser.parse(event.data)
-          if (frame) {
-            this.onFrame(frame)
+          const parsed = MptFrameParser.parse(event.data)
+          if (parsed) {
+            if (parsed.type === 'frame') {
+              this.onFrame(parsed.data)
+            } else if (parsed.type === 'alert') {
+              this.onAlert(parsed.data)
+            }
           }
         }
       }

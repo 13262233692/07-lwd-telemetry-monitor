@@ -25,6 +25,10 @@ public class MptSimulator implements CommandLineRunner {
     private ScheduledExecutorService executor;
     private volatile boolean running = false;
 
+    private static final double GAMMA_RAY_BASELINE = 45.0;
+    private static final double GAMMA_RAY_SHALE = 120.0;
+    private static final double GAMMA_RAY_GAS = 20.0;
+
     @Override
     public void run(String... args) throws Exception {
         start();
@@ -51,12 +55,20 @@ public class MptSimulator implements CommandLineRunner {
             float[][] waveformData = new float[MptConstants.WAVEFORM_CHANNELS][samples];
             double bitDepth = 2500.0 + seq * 0.1;
 
+            double gammaRay = generateGammaRay(seq);
+            boolean isGasZone = isInGasZone(seq);
+            boolean isWaterZone = isInWaterZone(seq);
+
+            double pWaveFreq = isGasZone ? 10000.0 : (isWaterZone ? 11000.0 : 12000.0);
+            double pWaveAmp = isGasZone ? 1.2 : (isWaterZone ? 0.5 : 0.8);
+            double pWaveDecay = isGasZone ? 12000.0 : (isWaterZone ? 6000.0 : 8000.0);
+
             for (int s = 0; s < samples; s++) {
                 double t = s / (double) MptConstants.WAVEFORM_SAMPLE_RATE_HZ;
 
                 waveformData[MptConstants.WAVEFORM_P_WAVE][s] =
-                        (float) (0.8 * Math.sin(2 * Math.PI * 12000 * t) *
-                                Math.exp(-t * 8000) +
+                        (float) (pWaveAmp * Math.sin(2 * Math.PI * pWaveFreq * t) *
+                                Math.exp(-t * pWaveDecay) +
                                 0.1 * (random.nextDouble() - 0.5));
 
                 waveformData[MptConstants.WAVEFORM_S_WAVE][s] =
@@ -79,6 +91,7 @@ public class MptSimulator implements CommandLineRunner {
                     .bitDepth((float) bitDepth)
                     .temperature((float) (150.0 + random.nextDouble() * 10))
                     .mudPressure((float) (5000.0 + random.nextDouble() * 200))
+                    .gammaRay((float) gammaRay)
                     .channelMask((short) 0x07)
                     .sampleCount(samples)
                     .waveformData(waveformData)
@@ -88,6 +101,40 @@ public class MptSimulator implements CommandLineRunner {
         } catch (Exception e) {
             log.error("Simulator error", e);
         }
+    }
+
+    private double generateGammaRay(int seq) {
+        double cyclePos = (seq % 400) / 400.0;
+
+        double base;
+        if (cyclePos < 0.25) {
+            base = GAMMA_RAY_BASELINE;
+        } else if (cyclePos < 0.4) {
+            double t = (cyclePos - 0.25) / 0.15;
+            base = GAMMA_RAY_BASELINE + (GAMMA_RAY_SHALE - GAMMA_RAY_BASELINE) * t;
+        } else if (cyclePos < 0.55) {
+            base = GAMMA_RAY_SHALE;
+        } else if (cyclePos < 0.65) {
+            double t = (cyclePos - 0.55) / 0.10;
+            base = GAMMA_RAY_SHALE + (GAMMA_RAY_GAS - GAMMA_RAY_SHALE) * t;
+        } else if (cyclePos < 0.80) {
+            base = GAMMA_RAY_GAS;
+        } else {
+            double t = (cyclePos - 0.80) / 0.20;
+            base = GAMMA_RAY_GAS + (GAMMA_RAY_BASELINE - GAMMA_RAY_GAS) * t;
+        }
+
+        return base + (random.nextDouble() - 0.5) * 8.0;
+    }
+
+    private boolean isInGasZone(int seq) {
+        double cyclePos = (seq % 400) / 400.0;
+        return cyclePos >= 0.65 && cyclePos < 0.80;
+    }
+
+    private boolean isInWaterZone(int seq) {
+        double cyclePos = (seq % 400) / 400.0;
+        return cyclePos >= 0.40 && cyclePos < 0.50;
     }
 
     public void stop() {

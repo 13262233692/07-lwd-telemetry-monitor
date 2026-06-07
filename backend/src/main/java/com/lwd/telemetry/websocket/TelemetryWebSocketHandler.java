@@ -1,6 +1,8 @@
 package com.lwd.telemetry.websocket;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.lwd.telemetry.lithology.LithologyAlert;
+import com.lwd.telemetry.mpt.MptConstants;
 import com.lwd.telemetry.mpt.MptFrame;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -20,6 +22,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 @Slf4j
 @Component
 public class TelemetryWebSocketHandler extends AbstractWebSocketHandler {
+
+    private static final byte MSG_TYPE_FRAME = 0x01;
+    private static final byte MSG_TYPE_ALERT = 0x02;
 
     private final List<WebSocketSession> sessions = new CopyOnWriteArrayList<>();
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -51,28 +56,49 @@ public class TelemetryWebSocketHandler extends AbstractWebSocketHandler {
 
         try {
             ByteBuffer binaryPayload = serializeFrameToBinary(frame);
-
-            for (WebSocketSession session : sessions) {
-                if (session.isOpen()) {
-                    try {
-                        session.sendMessage(new BinaryMessage(binaryPayload.duplicate()));
-                    } catch (IOException e) {
-                        log.warn("Failed to send to session {}: {}", session.getId(), e.getMessage());
-                        sessions.remove(session);
-                    }
-                }
-            }
+            sendToAll(binaryPayload);
         } catch (Exception e) {
             log.error("Error serializing frame for broadcast", e);
         }
     }
 
+    public void broadcastAlert(LithologyAlert alert) {
+        if (sessions.isEmpty()) {
+            return;
+        }
+
+        try {
+            String json = objectMapper.writeValueAsString(alert);
+            ByteBuffer payload = ByteBuffer.allocate(1 + json.getBytes().length);
+            payload.put(MSG_TYPE_ALERT);
+            payload.put(json.getBytes());
+            payload.flip();
+            sendToAll(payload);
+        } catch (Exception e) {
+            log.error("Error serializing alert for broadcast", e);
+        }
+    }
+
+    private void sendToAll(ByteBuffer payload) {
+        for (WebSocketSession session : sessions) {
+            if (session.isOpen()) {
+                try {
+                    session.sendMessage(new BinaryMessage(payload.duplicate()));
+                } catch (IOException e) {
+                    log.warn("Failed to send to session {}: {}", session.getId(), e.getMessage());
+                    sessions.remove(session);
+                }
+            }
+        }
+    }
+
     private ByteBuffer serializeFrameToBinary(MptFrame frame) throws IOException {
-        ByteArrayOutputStream baos = new ByteArrayOutputStream(8 + 16 +
+        ByteArrayOutputStream baos = new ByteArrayOutputStream(8 + 20 +
                 (frame.getWaveformData() != null ?
                         frame.getSampleCount() * MptConstants.WAVEFORM_CHANNELS * 2 : 0));
         DataOutputStream dos = new DataOutputStream(baos);
 
+        dos.writeByte(MSG_TYPE_FRAME);
         dos.writeInt(MptConstants.FRAME_SYNC_WORD);
 
         int frameLen = MptConstants.FRAME_HEADER_SIZE +
@@ -86,6 +112,7 @@ public class TelemetryWebSocketHandler extends AbstractWebSocketHandler {
         dos.writeInt(Float.floatToRawIntBits(frame.getBitDepth()));
         dos.writeInt(Float.floatToRawIntBits(frame.getTemperature()));
         dos.writeInt(Float.floatToRawIntBits(frame.getMudPressure()));
+        dos.writeInt(Float.floatToRawIntBits(frame.getGammaRay()));
 
         int maskSample = ((frame.getChannelMask() & 0x0F) << 12) | (frame.getSampleCount() & 0x0FFF);
         dos.writeShort(maskSample);
