@@ -1,0 +1,18 @@
+server:
+  port: 8080
+
+netty:
+  tcp:
+    port: 9600
+    boss-threads: 1
+    worker-threads: 4
+  mpt:
+    frame-sync-word: 0xABCD1234
+    max-frame-length: 65536
+    waveform-sample-rate: 20000
+    waveform-channels: 3
+    waveform-samples-per-frame: 512
+
+websocket:
+  path: /ws/telemetry
+  binary-enabled: true
